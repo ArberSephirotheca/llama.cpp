@@ -1711,7 +1711,8 @@ static webgpu_encoded_op ggml_webgpu_flash_attn(webgpu_context &       ctx,
         K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q8_0;
     const bool use_vec = (Q->ne[1] < 20) && (Q->ne[0] % 32 == 0) && (V->ne[0] % 4 == 0) && kv_vec_type_supported &&
                          (K->type != GGML_TYPE_F16 || f16_vec4_aligned) && (V->type == K->type);
-    const bool use_vec_decode = use_vec && Q->ne[1] == 1 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
+    const bool use_vec_decode_shape = use_vec && Q->ne[1] == 1;
+    const bool use_vec_decode = use_vec_decode_shape && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
                                 kv_direct && ctx->global_ctx->capabilities.max_subgroup_size == 32;
     const uint32_t vec_nwg_cap = std::max(1u, std::min<uint32_t>(32u, ctx->global_ctx->capabilities.max_subgroup_size));
     const bool     use_blk     = use_vec && !use_vec_decode && has_mask;
