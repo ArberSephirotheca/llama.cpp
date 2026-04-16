@@ -1713,7 +1713,7 @@ static webgpu_encoded_op ggml_webgpu_flash_attn(webgpu_context &       ctx,
                          (K->type != GGML_TYPE_F16 || f16_vec4_aligned) && (V->type == K->type);
     const bool use_vec_decode_shape = use_vec && Q->ne[1] == 1;
     const bool use_vec_decode = use_vec_decode_shape && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
-                                kv_direct && ctx->global_ctx->capabilities.max_subgroup_size == 32;
+                                kv_direct && ctx->global_ctx->capabilities.subgroup_size != 0;
     const uint32_t vec_nwg_cap = std::max(1u, std::min<uint32_t>(32u, ctx->global_ctx->capabilities.max_subgroup_size));
     const bool     use_blk     = use_vec && !use_vec_decode && has_mask;
 
@@ -3483,7 +3483,10 @@ static bool create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
 #endif
 
     // For subgroup matrix code to be the most efficient, we would like the subgroup size to be consistent and accurate.
-    // Unfortunately, that is not possible, so we use the maximum subgroup size reported by the adapter.
+    // Unfortunately, that is not possible in general, so we use the maximum subgroup size reported by the adapter.
+    // The decode-online flash-attn kernel is narrower: it only uses a fixed-width subgroup when the adapter reports one.
+    ctx->webgpu_global_ctx->capabilities.subgroup_size =
+        info.subgroupMinSize == info.subgroupMaxSize ? info.subgroupMaxSize : 0u;
     ctx->webgpu_global_ctx->capabilities.max_subgroup_size = info.subgroupMaxSize;
     // Initialize device
     std::vector<wgpu::FeatureName> required_features       = { wgpu::FeatureName::ShaderF16 };

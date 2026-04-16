@@ -18,8 +18,6 @@
 #define GGML_WEBGPU_I32_SIZE_BYTES                   4
 #define GGML_WEBGPU_FLASH_ATTN_PREFERRED_KV_SG_TILES 8u
 #define GGML_WEBGPU_FLASH_ATTN_PREFERRED_WG_SIZE     128u
-#define GGML_WEBGPU_FLASH_ATTN_VEC_DECODE_KV_TILE    64u
-#define GGML_WEBGPU_FLASH_ATTN_VEC_DECODE_WG_SIZE    32u
 // Matches GGML_PAD(..., 256) in src/llama-context.cpp for KV cache sizing.
 #define GGML_WEBGPU_KV_SEQ_PAD                       256u
 
@@ -2052,12 +2050,27 @@ class ggml_webgpu_shader_lib {
         defines.push_back(std::string("SG_MAT_N=") + std::to_string(context.sg_mat_n));
         defines.push_back(std::string("SG_MAT_K=") + std::to_string(context.sg_mat_k));
 
+        uint32_t wg_size = 0;
+        if (context.key.use_vec_decode) {
+            wg_size = std::max(1u, context.max_subgroup_size);
+        } else if (context.key.use_vec) {
+            wg_size = std::max(1u, std::min<uint32_t>(32u, context.max_subgroup_size));
+        } else {
+            wg_size = std::max(context.max_subgroup_size, GGML_WEBGPU_FLASH_ATTN_PREFERRED_WG_SIZE);
+        }
+
         uint32_t q_tile  = context.sg_mat_m;
         uint32_t kv_tile = std::min(ggml_webgpu_flash_attn_max_kv_tile(context),
                                     context.sg_mat_n * GGML_WEBGPU_FLASH_ATTN_PREFERRED_KV_SG_TILES);
         if (context.key.use_vec_decode) {
-            q_tile  = 1;
-            kv_tile = GGML_WEBGPU_FLASH_ATTN_VEC_DECODE_KV_TILE;
+            q_tile = 1;
+            // Default to two score slots per lane, then align to the padded KV cache chunk size.
+            kv_tile = std::max(wg_size, std::min<uint32_t>(GGML_WEBGPU_KV_SEQ_PAD, 2u * wg_size));
+            if (context.key.kv_direct) {
+                while (GGML_WEBGPU_KV_SEQ_PAD % kv_tile != 0 && kv_tile > wg_size) {
+                    kv_tile -= wg_size;
+                }
+            }
         } else if (context.key.use_vec) {
             q_tile  = 1;
             kv_tile = std::max(context.sg_mat_n, std::min(32u, ggml_webgpu_flash_attn_max_kv_tile(context)));
@@ -2065,28 +2078,16 @@ class ggml_webgpu_shader_lib {
             const uint32_t vec_ne = ggml_webgpu_flash_attn_pick_vec_ne(context.key);
             defines.push_back(std::string("VEC_NE=") + std::to_string(vec_ne) + "u");
         }
-        if (context.key.kv_direct) {
+        if (context.key.kv_direct && !context.key.use_vec_decode) {
             GGML_ASSERT(kv_tile <= GGML_WEBGPU_KV_SEQ_PAD);
             while (GGML_WEBGPU_KV_SEQ_PAD % kv_tile != 0) {
                 kv_tile -= context.sg_mat_n;
-                if (context.key.use_vec_decode && kv_tile < GGML_WEBGPU_FLASH_ATTN_VEC_DECODE_WG_SIZE) {
-                    kv_tile = GGML_WEBGPU_FLASH_ATTN_VEC_DECODE_WG_SIZE;
-                    break;
-                }
             }
         }
 
         defines.push_back(std::string("Q_TILE=") + std::to_string(q_tile));
         defines.push_back(std::string("KV_TILE=") + std::to_string(kv_tile));
 
-        uint32_t wg_size = 0;
-        if (context.key.use_vec_decode) {
-            wg_size = GGML_WEBGPU_FLASH_ATTN_VEC_DECODE_WG_SIZE;
-        } else if (context.key.use_vec) {
-            wg_size = std::max(1u, std::min<uint32_t>(32u, context.max_subgroup_size));
-        } else {
-            wg_size = std::max(context.max_subgroup_size, GGML_WEBGPU_FLASH_ATTN_PREFERRED_WG_SIZE);
-        }
         defines.push_back(std::string("WG_SIZE=") + std::to_string(wg_size));
 
         const char *    shader_src = context.key.use_vec_decode ? wgsl_flash_attn_vec_decode :
