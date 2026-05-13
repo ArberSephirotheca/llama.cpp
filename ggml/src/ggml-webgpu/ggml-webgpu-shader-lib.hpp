@@ -596,7 +596,7 @@ struct ggml_webgpu_flash_attn_decisions {
 };
 
 inline constexpr uint32_t GGML_WEBGPU_FLASH_ATTN_TILE_KV_VEC_WIDTH = 4u;
-inline constexpr uint32_t GGML_WEBGPU_FLASH_ATTN_TILE_Q_TILE       = 4u;
+inline constexpr uint32_t GGML_WEBGPU_FLASH_ATTN_TILE_Q_TILE       = 8u;
 
 inline uint32_t ggml_webgpu_flash_attn_pick_vec_ne(const ggml_webgpu_flash_attn_pipeline_key & key) {
     if (key.path != GGML_WEBGPU_FLASH_ATTN_PATH_VEC || key.kv_type != GGML_TYPE_F16 ||
@@ -704,6 +704,17 @@ inline size_t ggml_webgpu_flash_attn_wg_mem_bytes(uint32_t q_tile,
         }
         f32_elems += kv_tile;                     // inter_shmem
         return f32_elems * GGML_WEBGPU_F32_SIZE_BYTES;
+    }
+    if (path == GGML_WEBGPU_FLASH_ATTN_PATH_TILE) {
+        f32_elems += q_tile * head_dim_qk;        // q_shmem
+        if (!kv_direct) {
+            f16_elems += kv_tile * max_head_dim;  // kv_shmem
+        }
+        f32_elems += q_tile * kv_tile;            // p_shmem
+        if (has_mask) {
+            f32_elems += std::max(GGML_WEBGPU_FLASH_ATTN_PREFERRED_WG_SIZE, q_tile * 32u);  // tile_visible_wg
+        }
+        return f16_elems * GGML_WEBGPU_F16_SIZE_BYTES + f32_elems * GGML_WEBGPU_F32_SIZE_BYTES;
     }
     f32_elems += q_tile * head_dim_qk;        // q_shmem
     if (!kv_direct) {
@@ -1868,7 +1879,7 @@ class ggml_webgpu_shader_lib {
                           (context.src0->type == GGML_TYPE_F32 || context.src0->type == GGML_TYPE_F16)) ?
                                                    1 :
                                                    0;
-        key.use_subgroup_matrix              = context.supports_subgroup_matrix;
+        key.use_subgroup_matrix              = false;
 
         auto it = mul_mat_fast_pipelines.find(key);
         if (it != mul_mat_fast_pipelines.end()) {
