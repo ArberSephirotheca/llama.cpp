@@ -119,11 +119,12 @@ struct Params {
 const FLOAT_MIN: f32 = -1.0e9;
 const Q_CHUNKS: u32 = HEAD_DIM_QK / 4u;
 const V_CHUNKS: u32 = HEAD_DIM_V / 4u;
+const KV_STAGE_CHUNKS: u32 = KV_STAGE_STRIDE / 4u;
 const SCORE_REGS_PER_LANE: u32 = (KV_TILE + MIN_SUBGROUP_SIZE - 1u) / MIN_SUBGROUP_SIZE;
 const OUT_REGS_PER_LANE: u32 = (V_CHUNKS + MIN_SUBGROUP_SIZE - 1u) / MIN_SUBGROUP_SIZE;
 
 var<workgroup> q_shmem: array<f32, Q_TILE * HEAD_DIM_QK>;
-var<workgroup> kv_shmem: array<f32, KV_TILE * KV_STAGE_STRIDE>;
+var<workgroup> kv_shmem: array<vec4<KV_TYPE>, KV_TILE * KV_STAGE_CHUNKS>;
 var<workgroup> p_shmem: array<f32, Q_TILE * KV_TILE>;
 
 @compute @workgroup_size(WG_SIZE)
@@ -206,17 +207,44 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
             local_scores[slot] = FLOAT_MIN;
         }
 
-        for (var vec_idx_local = local_id.x; vec_idx_local < kv_count * Q_CHUNKS; vec_idx_local += WG_SIZE) {
-            let kv_local = vec_idx_local / Q_CHUNKS;
-            let chunk = vec_idx_local % Q_CHUNKS;
-            let global_k_row = kv_tile + kv_local;
-            let k_vec_index = (k_head_offset + global_k_row * params.stride_k1 + chunk * 4u) >> 2u;
-            let k4 = K[k_vec_index];
-            let kv_off = kv_local * KV_STAGE_STRIDE + chunk * 4u;
-            kv_shmem[kv_off + 0u] = f32(k4.x);
-            kv_shmem[kv_off + 1u] = f32(k4.y);
-            kv_shmem[kv_off + 2u] = f32(k4.z);
-            kv_shmem[kv_off + 3u] = f32(k4.w);
+        var tile_visible = true;
+#ifdef MASK
+        var local_visible = 0u;
+        for (var elem_idx = local_id.x; elem_idx < Q_TILE * kv_count; elem_idx += WG_SIZE) {
+            let q_local = elem_idx / kv_count;
+            let kv_local = elem_idx % kv_count;
+            let q_row = q_row_start + q_local;
+            let k_row = kv_tile + kv_local;
+
+            if (q_local < Q_TILE && q_row < params.seq_len_q && k_row < params.seq_len_kv) {
+                let mask_idx = mask_global_offset + q_local * params.seq_len_kv + k_row;
+                let m = f32(mask[mask_idx]);
+                if (m > FLOAT_MIN * 0.5) {
+                    local_visible = 1u;
+                }
+            }
+        }
+        tile_visible_wg[local_id.x] = local_visible;
+        workgroupBarrier();
+
+        for (var reduce_stride = WG_SIZE / 2u; reduce_stride > 0u; reduce_stride = reduce_stride / 2u) {
+            if (local_id.x < reduce_stride) {
+                tile_visible_wg[local_id.x] = max(tile_visible_wg[local_id.x], tile_visible_wg[local_id.x + reduce_stride]);
+            }
+            workgroupBarrier();
+        }
+        tile_visible = tile_visible_wg[0] != 0u;
+#endif
+
+        if (tile_visible) {
+            for (var vec_idx_local = local_id.x; vec_idx_local < kv_count * Q_CHUNKS; vec_idx_local += WG_SIZE) {
+                let kv_local = vec_idx_local / Q_CHUNKS;
+                let chunk = vec_idx_local % Q_CHUNKS;
+                let global_k_row = kv_tile + kv_local;
+                let k_vec_index = (k_head_offset + global_k_row * params.stride_k1 + chunk * 4u) >> 2u;
+                let k4 = K[k_vec_index];
+                kv_shmem[kv_local * KV_STAGE_CHUNKS + chunk] = k4;
+            }
         }
 
         workgroupBarrier();
@@ -238,12 +266,7 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
                         q_shmem[q_off + 1u],
                         q_shmem[q_off + 2u],
                         q_shmem[q_off + 3u]);
-                    let kv_off = kv_local * KV_STAGE_STRIDE + chunk * 4u;
-                    let kv = vec4<f32>(
-                        kv_shmem[kv_off + 0u],
-                        kv_shmem[kv_off + 1u],
-                        kv_shmem[kv_off + 2u],
-                        kv_shmem[kv_off + 3u]);
+                    let kv = vec4<f32>(kv_shmem[kv_local * KV_STAGE_CHUNKS + chunk]);
                     dot_val += dot(qv, kv);
                 }
 #ifdef LOGIT_SOFTCAP
@@ -278,17 +301,15 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
 
         workgroupBarrier();
 
-        for (var vec_idx_local = local_id.x; vec_idx_local < kv_count * V_CHUNKS; vec_idx_local += WG_SIZE) {
-            let kv_local = vec_idx_local / V_CHUNKS;
-            let chunk = vec_idx_local % V_CHUNKS;
-            let global_v_row = kv_tile + kv_local;
-            let v_vec_index = (v_head_offset + global_v_row * params.stride_v1 + chunk * 4u) >> 2u;
-            let v4 = V[v_vec_index];
-            let kv_off = kv_local * KV_STAGE_STRIDE + chunk * 4u;
-            kv_shmem[kv_off + 0u] = f32(v4.x);
-            kv_shmem[kv_off + 1u] = f32(v4.y);
-            kv_shmem[kv_off + 2u] = f32(v4.z);
-            kv_shmem[kv_off + 3u] = f32(v4.w);
+        if (tile_visible) {
+            for (var vec_idx_local = local_id.x; vec_idx_local < kv_count * V_CHUNKS; vec_idx_local += WG_SIZE) {
+                let kv_local = vec_idx_local / V_CHUNKS;
+                let chunk = vec_idx_local % V_CHUNKS;
+                let global_v_row = kv_tile + kv_local;
+                let v_vec_index = (v_head_offset + global_v_row * params.stride_v1 + chunk * 4u) >> 2u;
+                let v4 = V[v_vec_index];
+                kv_shmem[kv_local * KV_STAGE_CHUNKS + chunk] = v4;
+            }
         }
 
         workgroupBarrier();
@@ -307,12 +328,7 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
                 var acc = out_regs[reg_idx];
                 for (var kv_local = 0u; kv_local < kv_count; kv_local += 1u) {
                     let p = p_shmem[subgroup_p_offset + kv_local];
-                    let kv_off = kv_local * KV_STAGE_STRIDE + chunk * 4u;
-                    let v4 = vec4<f32>(
-                        kv_shmem[kv_off + 0u],
-                        kv_shmem[kv_off + 1u],
-                        kv_shmem[kv_off + 2u],
-                        kv_shmem[kv_off + 3u]);
+                    let v4 = vec4<f32>(kv_shmem[kv_local * KV_STAGE_CHUNKS + chunk]);
                     acc += p * v4;
                 }
                 out_regs[reg_idx] = acc;
